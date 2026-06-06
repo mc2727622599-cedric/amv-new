@@ -1,0 +1,516 @@
+# 单文件全自动构建:本 workflow 自带全部工程源码,
+# 在云端生成工程 → 从源码编译 arm64 静态版 ffmpeg → 构建 APK。
+# 用法:GitHub 仓库里创建 .github/workflows/build-apk.yml 粘贴本文件内容即可。
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 生成工程文件(全部源码内嵌于本 workflow)
+        run: |
+          cat > settings.gradle.kts << 'PROJECT_FILE_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AMVConverter"
+          include(":app")
+          PROJECT_FILE_EOF
+
+          cat > build.gradle.kts << 'PROJECT_FILE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          PROJECT_FILE_EOF
+
+          cat > gradle.properties << 'PROJECT_FILE_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          PROJECT_FILE_EOF
+
+          mkdir -p gradle/wrapper
+          cat > gradle/wrapper/gradle-wrapper.properties << 'PROJECT_FILE_EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          PROJECT_FILE_EOF
+
+          mkdir -p app
+          cat > app/build.gradle.kts << 'PROJECT_FILE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.amv.converter"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.amv.converter"
+                  minSdk = 29            // Android 10+
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a") }
+              }
+
+              // 关键:安装时把 jniLibs 解压到磁盘,才能以可执行文件方式运行 ffmpeg
+              packaging { jniLibs { useLegacyPackaging = true } }
+
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies { }   // 零第三方依赖,规避 FFmpegKit 停更的供应链问题
+          PROJECT_FILE_EOF
+
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'PROJECT_FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:extractNativeLibs="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          PROJECT_FILE_EOF
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml << 'PROJECT_FILE_EOF'
+          <resources>
+              <string name="app_name">AMV 转换器</string>
+          </resources>
+          PROJECT_FILE_EOF
+
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml << 'PROJECT_FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp">
+
+              <Button
+                  android:id="@+id/btnPick"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="选择输入文件(.amv 或 .mp4 等)" />
+
+              <TextView
+                  android:id="@+id/txtFile"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="6dp"
+                  android:text="未选择文件"
+                  android:textColor="#666666" />
+
+              <TextView
+                  android:id="@+id/txtDirection"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="4dp"
+                  android:text="方向按扩展名自动判断:.amv → .mp4,其他 → .amv"
+                  android:textColor="#666666" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:orientation="horizontal"
+                  android:gravity="center_vertical">
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="帧率: " />
+
+                  <Spinner
+                      android:id="@+id/spFps"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:text="分辨率: " />
+
+                  <Spinner
+                      android:id="@+id/spSize"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1" />
+              </LinearLayout>
+
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="2dp"
+                  android:text="(转 AMV 时生效;帧率必须整除 22050,这是 AMV 音频分块的硬性约束)"
+                  android:textSize="12sp"
+                  android:textColor="#888888" />
+
+              <Button
+                  android:id="@+id/btnConvert"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:enabled="false"
+                  android:text="开始转换" />
+
+              <ScrollView
+                  android:id="@+id/scroll"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:layout_marginTop="12dp"
+                  android:background="#F2F2F2">
+
+                  <TextView
+                      android:id="@+id/txtLog"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:padding="8dp"
+                      android:textSize="12sp"
+                      android:typeface="monospace"
+                      android:textIsSelectable="true" />
+              </ScrollView>
+          </LinearLayout>
+          PROJECT_FILE_EOF
+
+          mkdir -p app/src/main/java/com/amv/converter
+          cat > app/src/main/java/com/amv/converter/FFmpegRunner.kt << 'PROJECT_FILE_EOF'
+          package com.amv.converter
+
+          import android.content.Context
+          import java.io.File
+
+          /**
+           * 负责定位 App 内置的 ffmpeg 可执行文件,并按照逆向分析得到的
+           * AMV 格式约束构造转换命令(与 Windows 版转换器参数完全一致)。
+           *
+           * ffmpeg 以 jniLibs/arm64-v8a/libffmpeg.so 的名义打进 APK;
+           * 安装后位于 nativeLibraryDir,该目录下的文件允许被 exec
+           * (Android 10+ 的 W^X 限制对 nativeLibraryDir 放行)。
+           */
+          object FFmpegRunner {
+
+              /** 帧率必须整除 22050(每个视频帧配一个音频块,块样本数 = 22050/fps) */
+              val VALID_AMV_FPS = listOf(10, 14, 15, 18, 21, 25, 30)
+              val AMV_SIZES = listOf("160x120", "128x96", "128x128", "208x176", "320x240")
+
+              fun ffmpegPath(ctx: Context): File =
+                  File(ctx.applicationInfo.nativeLibraryDir, "libffmpeg.so")
+
+              fun isReady(ctx: Context): Boolean = ffmpegPath(ctx).canExecute()
+
+              /** 构造命令。dst 扩展名为 .amv 时走 MP4→AMV,否则走 AMV→MP4。 */
+              fun buildCommand(
+                  ctx: Context, src: File, dst: File,
+                  fps: Int, size: String
+              ): List<String> {
+                  val ff = ffmpegPath(ctx).absolutePath
+                  return if (dst.extension.lowercase() == "amv") {
+                      require(fps in VALID_AMV_FPS) { "AMV 帧率必须整除 22050" }
+                      val (w, h) = size.split("x").map { it.toInt() }
+                      val block = 22050 / fps
+                      listOf(
+                          ff, "-y", "-hide_banner", "-i", src.absolutePath,
+                          "-vf", "scale=$w:$h:force_original_aspect_ratio=decrease," +
+                                  "pad=$w:$h:(ow-iw)/2:(oh-ih)/2,fps=$fps",
+                          "-c:v", "amv", "-strict", "-1",
+                          "-c:a", "adpcm_ima_amv", "-ar", "22050", "-ac", "1",
+                          "-block_size", block.toString(),
+                          dst.absolutePath
+                      )
+                  } else {
+                      // 自编译的静态版 ffmpeg 不含 libx264,使用内置 mpeg4 编码器
+                      // (所有播放器都能放;如需 H.264 可在电脑上用 Windows 版再转一次)
+                      listOf(
+                          ff, "-y", "-hide_banner", "-i", src.absolutePath,
+                          "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                          "-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-q:v", "4",
+                          "-c:a", "aac", "-b:a", "160k",
+                          "-movflags", "+faststart",
+                          dst.absolutePath
+                      )
+                  }
+              }
+
+              /**
+               * 执行转换;onLine 回调 ffmpeg 输出行(已过滤为进度/错误行)。
+               * @return ffmpeg 退出码,0 为成功
+               */
+              fun run(cmd: List<String>, onLine: (String) -> Unit): Int {
+                  val proc = ProcessBuilder(cmd).redirectErrorStream(true).start()
+                  proc.inputStream.bufferedReader().forEachLine { line ->
+                      if (line.startsWith("frame=") || line.contains("time=") ||
+                          line.contains("Error") || line.contains("Invalid")
+                      ) onLine(line.trim())
+                  }
+                  return proc.waitFor()
+              }
+          }
+          PROJECT_FILE_EOF
+
+          mkdir -p app/src/main/java/com/amv/converter
+          cat > app/src/main/java/com/amv/converter/MainActivity.kt << 'PROJECT_FILE_EOF'
+          package com.amv.converter
+
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import android.widget.*
+          import java.io.File
+          import kotlin.concurrent.thread
+
+          class MainActivity : Activity() {
+
+              private lateinit var btnPick: Button
+              private lateinit var btnConvert: Button
+              private lateinit var txtFile: TextView
+              private lateinit var txtDirection: TextView
+              private lateinit var txtLog: TextView
+              private lateinit var scroll: ScrollView
+              private lateinit var spFps: Spinner
+              private lateinit var spSize: Spinner
+
+              private var inputName: String? = null   // 原始文件名(含扩展名)
+              private var inputFile: File? = null     // 拷贝到 cache 的本地副本
+
+              private val REQ_OPEN = 1
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  btnPick = findViewById(R.id.btnPick)
+                  btnConvert = findViewById(R.id.btnConvert)
+                  txtFile = findViewById(R.id.txtFile)
+                  txtDirection = findViewById(R.id.txtDirection)
+                  txtLog = findViewById(R.id.txtLog)
+                  scroll = findViewById(R.id.scroll)
+                  spFps = findViewById(R.id.spFps)
+                  spSize = findViewById(R.id.spSize)
+
+                  spFps.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item,
+                      FFmpegRunner.VALID_AMV_FPS.map { it.toString() })
+                  spFps.setSelection(FFmpegRunner.VALID_AMV_FPS.indexOf(15))
+                  spSize.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item, FFmpegRunner.AMV_SIZES)
+
+                  btnPick.setOnClickListener {
+                      val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                          addCategory(Intent.CATEGORY_OPENABLE)
+                          type = "*/*"   // .amv 没有标准 MIME,放开全部
+                      }
+                      startActivityForResult(i, REQ_OPEN)
+                  }
+
+                  btnConvert.setOnClickListener { startConvert() }
+
+                  if (FFmpegRunner.isReady(this)) {
+                      log("ffmpeg 就绪:${FFmpegRunner.ffmpegPath(this).absolutePath}")
+                      log("选择文件后点击“开始转换”。输出保存在 下载/Download 目录。")
+                  } else {
+                      log("⚠ 未找到内置 ffmpeg!")
+                      log("请按 README 把 arm64 静态版 ffmpeg 重命名为 libffmpeg.so,")
+                      log("放入 app/src/main/jniLibs/arm64-v8a/ 后重新构建安装。")
+                  }
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode != REQ_OPEN || resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  val name = queryDisplayName(uri) ?: "input.bin"
+                  inputName = name
+                  txtFile.text = name
+                  txtDirection.text = if (name.lowercase().endsWith(".amv"))
+                      "方向:AMV → MP4(H.264 + AAC)"
+                  else
+                      "方向:视频 → AMV(无头MJPEG + IMA-ADPCM 22050Hz 单声道)"
+                  // SAF 的 Uri 不能直接喂给 ffmpeg,先拷贝成本地文件
+                  log("正在导入文件…")
+                  btnConvert.isEnabled = false
+                  thread {
+                      val dst = File(cacheDir, "in_${name}")
+                      contentResolver.openInputStream(uri)!!.use { ins ->
+                          dst.outputStream().use { ins.copyTo(it) }
+                      }
+                      inputFile = dst
+                      runOnUiThread {
+                          log("已导入:${dst.length() / 1024} KB")
+                          btnConvert.isEnabled = true
+                      }
+                  }
+              }
+
+              private fun startConvert() {
+                  val src = inputFile ?: return
+                  val name = inputName ?: return
+                  val base = name.substringBeforeLast('.')
+                  val toAmv = !name.lowercase().endsWith(".amv")
+                  val outName = base + if (toAmv) ".amv" else ".mp4"
+                  val outTmp = File(cacheDir, "out_$outName")
+
+                  val fps = spFps.selectedItem.toString().toInt()
+                  val size = spSize.selectedItem.toString()
+
+                  btnConvert.isEnabled = false
+                  btnConvert.text = "转换中…"
+                  thread {
+                      try {
+                          val cmd = FFmpegRunner.buildCommand(this, src, outTmp, fps, size)
+                          log("命令:" + cmd.joinToString(" "))
+                          val rc = FFmpegRunner.run(cmd) { line -> log(line) }
+                          if (rc == 0) {
+                              val saved = saveToDownloads(outTmp, outName, toAmv)
+                              log("✔ 完成:已保存到 下载/Download/$outName")
+                              log("  (${outTmp.length() / 1024} KB)")
+                              if (!saved) log("⚠ 写入下载目录失败,文件仍在应用缓存:${outTmp.absolutePath}")
+                          } else {
+                              log("✘ 失败,ffmpeg 返回码 $rc")
+                          }
+                      } catch (e: Exception) {
+                          log("✘ ${e.message}")
+                      } finally {
+                          runOnUiThread {
+                              btnConvert.isEnabled = true
+                              btnConvert.text = "开始转换"
+                          }
+                      }
+                  }
+              }
+
+              /** 通过 MediaStore 把结果写入公共“下载”目录(无需任何存储权限,API 29+)。 */
+              private fun saveToDownloads(f: File, displayName: String, isAmv: Boolean): Boolean {
+                  return try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                          put(MediaStore.MediaColumns.MIME_TYPE,
+                              if (isAmv) "application/octet-stream" else "video/mp4")
+                      }
+                      val uri: Uri = contentResolver.insert(
+                          MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return false
+                      contentResolver.openOutputStream(uri)!!.use { out ->
+                          f.inputStream().use { it.copyTo(out) }
+                      }
+                      true
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
+
+              private fun queryDisplayName(uri: Uri): String? =
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+                  }
+
+              private fun log(s: String) = runOnUiThread {
+                  txtLog.append(s + "\n")
+                  scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+              }
+          }
+          PROJECT_FILE_EOF
+
+          echo "工程文件已生成:" && find . -type f | sort
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 缓存 ffmpeg 产物(命中则跳过约 10 分钟的编译)
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/jniLibs/arm64-v8a/libffmpeg.so
+          key: ffmpeg-android-arm64-static-7.1-v1
+
+      - name: 从源码编译 Android arm64 静态版 ffmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          NDK="$ANDROID_NDK_LATEST_HOME"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          curl -sLO https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
+          tar xf ffmpeg-7.1.tar.xz
+          cd ffmpeg-7.1
+          ./configure \
+            --target-os=android --arch=aarch64 --cpu=armv8-a \
+            --enable-cross-compile \
+            --cc="$TC/bin/aarch64-linux-android29-clang" \
+            --cxx="$TC/bin/aarch64-linux-android29-clang++" \
+            --ar="$TC/bin/llvm-ar" --nm="$TC/bin/llvm-nm" \
+            --ranlib="$TC/bin/llvm-ranlib" --strip="$TC/bin/llvm-strip" \
+            --disable-shared --enable-static \
+            --disable-doc --disable-ffplay --disable-ffprobe \
+            --disable-debug \
+            --extra-cflags="-Os" --extra-ldflags="-static"
+          make -j"$(nproc)"
+          "$TC/bin/llvm-strip" ffmpeg
+          mkdir -p ../app/src/main/jniLibs/arm64-v8a
+          cp ffmpeg ../app/src/main/jniLibs/arm64-v8a/libffmpeg.so
+
+      - name: 上传 ffmpeg 二进制(供本地 Android Studio 构建使用)
+        uses: actions/upload-artifact@v4
+        with:
+          name: libffmpeg-arm64
+          path: app/src/main/jniLibs/arm64-v8a/libffmpeg.so
+
+      - name: 安装 Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: 构建 Debug APK
+        run: gradle assembleDebug
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AMV-Converter-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
